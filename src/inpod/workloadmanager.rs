@@ -18,6 +18,7 @@ use backoff::{ExponentialBackoff, backoff::Backoff};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::UnixStream;
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use super::Error;
@@ -239,6 +240,10 @@ impl WorkloadProxyManager {
         };
 
         Ok(())
+    }
+
+    pub fn new_workload_subscriber(&self) -> broadcast::Receiver<(String, i32, i32)> {
+        self.state.change_notifier.subscribe()
     }
 }
 

@@ -116,12 +116,17 @@ educe = "0.6"
 [target.'cfg(target_os = "linux")'.dependencies]
 netns-rs = "0.1"
 pprof = { version = "0.14", features = ["protobuf", "protobuf-codec", "criterion"] }
+libbpf-rs = "=0.26.0-beta.0"
 
 [build-dependencies]
 tonic-build = { version = "0.13", default-features = false, features = ["prost"] }
 prost-build = "0.13"
 anyhow = "1.0"
 rustc_version = "0.4"
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+libbpf-cargo = "0.26.0-beta.0"
+vmlinux = { git = "https://github.com/libbpf/vmlinux.h.git", rev = "83a228cf37fc65f2d14e4896a04922b5ee531a94" }
 
 [profile.release]
 opt-level = 3

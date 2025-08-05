@@ -29,7 +29,7 @@ use tracing::{Instrument, warn};
 
 use crate::identity::SecretManager;
 use crate::state::ProxyStateManager;
-use crate::{admin, config, metrics, proxy, readiness, signal};
+use crate::{admin, bpf, config, metrics, proxy, readiness, signal};
 use crate::{dns, xds};
 
 pub async fn build_with_cert(
@@ -60,6 +60,9 @@ pub async fn build_with_cert(
     } else {
         None
     };
+
+    // Create and start the eBPF program for transparent network policies.
+    let mut bpf_task = new_bpf(config.clone());
 
     // Create and start the readiness server.
     let readiness_server = readiness::Server::new(config.clone(), drain_rx.clone(), ready.clone())
@@ -104,6 +107,11 @@ pub async fn build_with_cert(
     });
     let state = state_mgr.state();
 
+    // Set the workload subscriber for bpf_task if it exists.
+    if let Some(ref mut bpf_task) = bpf_task {
+        bpf_task.with_state_workload_subscriber(state.read().workloads.new_subscriber());
+    }
+
     // Run the XDS state manager in the current tokio worker pool.
     tokio::spawn(state_mgr.run());
 
@@ -143,6 +151,7 @@ pub async fn build_with_cert(
             proxy_gen,
             ready.clone(),
             drain_rx.clone(),
+            &mut bpf_task,
         )?;
 
         let mut xds_rx_for_proxy = xds_rx.clone();
@@ -325,12 +334,18 @@ fn init_inpod_proxy_mgr(
     proxy_gen: ProxyFactory,
     ready: readiness::Ready,
     drain_rx: drain::DrainWatcher,
+    bpf_task: &mut Option<bpf::BpfTask>,
 ) -> anyhow::Result<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>> {
     let metrics = Arc::new(crate::inpod::metrics::Metrics::new(
         registry.sub_registry_with_prefix("workload_manager"),
     ));
     let proxy_mgr = crate::inpod::init_and_new(metrics, admin_server, config, proxy_gen, ready)
         .map_err(|e| anyhow::anyhow!("failed to start workload proxy manager {:?}", e))?;
+
+    // Subscribe netns workload sockets to the bpf_task if it exists.
+    if let Some(bpf_task) = bpf_task {
+        bpf_task.with_proxy_workload_subscriber(proxy_mgr.new_workload_subscriber());
+    }
 
     Ok(Box::pin(async move {
         match proxy_mgr.run(drain_rx).await {
@@ -341,6 +356,21 @@ fn init_inpod_proxy_mgr(
             }
         }
     }))
+}
+
+#[cfg(target_os = "linux")]
+fn new_bpf(config: Arc<config::Config>) -> Option<bpf::BpfTask> {
+    if config.transparent_network_policies {
+        match bpf::init_bpf() {
+            Ok(bpf) => Some(bpf),
+            Err(e) => {
+                tracing::error!("Failed to initialize BPF program: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    }
 }
 
 pub struct Bound {

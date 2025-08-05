@@ -35,7 +35,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::{fmt, net};
 use thiserror::Error;
-use tokio::sync::watch::{Receiver, Sender};
+use tokio::sync::broadcast::{Receiver, Sender};
 use tracing::{error, trace};
 use xds::istio::workload::ApplicationTunnel as XdsApplicationTunnel;
 use xds::istio::workload::GatewayAddress as XdsGatewayAddress;
@@ -217,6 +217,12 @@ pub mod address {
         Workload(Arc<Workload>),
         Service(Arc<Service>),
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkloadChange {
+    pub old: Option<Workload>,
+    pub new: Option<Workload>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
@@ -690,7 +696,7 @@ pub struct WorkloadStore {
     // TODO this could be expanded to Sender<Workload> + a full subscriber/streaming
     // model, but for now just notifying watchers to wake when _any_ insert happens
     // is simpler (and only requires a channelsize of 1)
-    insert_notifier: Sender<()>,
+    change_notifier: Sender<WorkloadChange>,
 
     /// by_addr maps workload network addresses to workloads
     by_addr: HashMap<NetworkAddress, WorkloadByAddr>,
@@ -773,7 +779,7 @@ impl WorkloadStore {
     pub fn new(local_node: Option<Strng>) -> Self {
         WorkloadStore {
             local_node,
-            insert_notifier: Sender::new(()),
+            change_notifier: Sender::new(100),
             by_addr: Default::default(),
             node_local_by_identity: Default::default(),
             by_uid: Default::default(),
@@ -783,13 +789,13 @@ impl WorkloadStore {
     // Returns a new subscriber. Note that subscribers are only guaranteed to be notified on
     // new values sent _after_ their creation, so callers should create, check current state,
     // then sub.
-    pub fn new_subscriber(&self) -> Receiver<()> {
-        self.insert_notifier.subscribe()
+    pub fn new_subscriber(&self) -> Receiver<WorkloadChange> {
+        self.change_notifier.subscribe()
     }
 
     pub fn insert(&mut self, w: Arc<Workload>) {
         // First, remove the entry entirely to make sure things are cleaned up properly.
-        self.remove(&w.uid);
+        let old =self.remove(&w.uid);
 
         if w.network_mode != NetworkMode::HostNetwork {
             for ip in &w.workload_ips {
@@ -811,7 +817,12 @@ impl WorkloadStore {
 
         // We have stored a newly inserted workload, notify watchers
         // (if any) to wake.
-        self.insert_notifier.send_replace(());
+        if let Err(e) = self.change_notifier.send(WorkloadChange {
+            old,
+            new: Some(w.deref().clone()),
+        }) {
+            error!("Failed to send workload change notification: {}", e);
+        }
     }
 
     pub fn remove(&mut self, uid: &Strng) -> Option<Workload> {
@@ -840,6 +851,14 @@ impl WorkloadStore {
                     }
                 }
 
+                // Notify watchers of the change
+                if let Err(e) = self.change_notifier.send(WorkloadChange {
+                    old: Some(prev.deref().clone()),
+                    new: None,
+                }) {
+                    eprintln!("Failed to send workload change notification: {}", e);
+                }
+                // Return the workload that was removed
                 Some(prev.deref().clone())
             }
         }

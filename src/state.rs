@@ -707,7 +707,13 @@ impl DemandProxyState {
                     warn!("timed out waiting for workload '{wl}' from xds");
                     break None;
                 },
-                _ = wl_sub.changed() => {
+                result = wl_sub.recv() => {
+                    if let Ok(result) = result {
+                        if result.new.is_none() {
+                            // Removed only, continue waiting
+                            continue;
+                        }
+                    }
                     if let Some(wl) = self.find_by_info(wl) {
                         break Some(wl);
                     }

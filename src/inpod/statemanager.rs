@@ -14,7 +14,9 @@
 
 use crate::drain;
 use crate::drain::DrainTrigger;
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tracing::{Instrument, debug, info};
 
 use super::{Error, WorkloadMessage, metrics::Metrics};
@@ -31,6 +33,7 @@ use super::netns::{InpodNetns, NetnsID};
 pub(super) struct WorkloadState {
     drain: DrainTrigger,
     netns_id: NetnsID,
+    workload_full_name: String,
 }
 
 #[derive(Default)]
@@ -76,6 +79,9 @@ pub struct WorkloadProxyManagerState {
     snapshot_names: std::collections::HashSet<WorkloadUid>,
 
     inpod_config: InPodConfig,
+
+    // Workload change notifier
+    pub(crate) change_notifier: broadcast::Sender<(String, i32, i32)>,
 }
 
 impl WorkloadProxyManagerState {
@@ -96,6 +102,8 @@ impl WorkloadProxyManagerState {
             snapshot_received: false,
             snapshot_names: Default::default(),
             inpod_config,
+
+            change_notifier: broadcast::Sender::new(100),
         }
     }
 
@@ -279,6 +287,7 @@ impl WorkloadProxyManagerState {
             .proxy_pending(workload_uid, workload_info);
 
         let workload_netns_id = netns.workload_netns_id();
+        let workload_netns_fd = netns.workload_netns().as_raw_fd();
 
         debug!(
             workload=?workload_uid,
@@ -309,6 +318,7 @@ impl WorkloadProxyManagerState {
         let admin_handler = self.admin_handler.clone();
 
         metrics.proxies_started.inc();
+        let inbound_listener_fd = proxies.proxy.as_ref().map(|p| p.inbound_listener_fd());
         if let Some(proxy) = proxies.proxy {
             tokio::spawn(
                 async move {
@@ -324,13 +334,26 @@ impl WorkloadProxyManagerState {
             tokio::spawn(proxy.run().instrument(tracing::info_span!("dns_proxy", wl=%format!("{}/{}", workload_info.namespace, workload_info.name))));
         }
 
+        let workload_full_name = format!("{}/{}", workload_info.namespace, workload_info.name);
         self.workload_states.insert(
             workload_uid.clone(),
             WorkloadState {
                 drain: drain_tx,
                 netns_id: workload_netns_id,
+                workload_full_name: workload_full_name.clone(),
             },
         );
+
+        // Send the change notifier with the new workload info
+        if let Some(listener_fd) = inbound_listener_fd {
+            if let Err(e) = self.change_notifier.send((
+                workload_full_name,
+                workload_netns_fd,
+                listener_fd,
+            )) {
+                eprintln!("Failed to send workload change notification: {}", e);
+            }
+        }
 
         Ok(())
     }
@@ -366,9 +389,19 @@ impl WorkloadProxyManagerState {
         // for idempotency, we ignore errors here (maybe just log / metric them)
         self.pending_workloads.remove(workload_uid);
         let Some(workload_state) = self.workload_states.remove(workload_uid) else {
+
             // TODO: add metrics
             return;
         };
+
+        // Send the change notifier with the new workload info
+        if let Err(e) = self.change_notifier.send((
+            workload_state.workload_full_name.clone(),
+            -1,
+            -1,
+        )) {
+            eprintln!("Failed to send workload change notification: {}", e);
+        }
 
         self.update_proxy_count_metrics();
 

@@ -347,6 +347,10 @@ impl Proxy {
             socks5: self.socks5.as_ref().map(|s| s.address()),
         }
     }
+
+    pub fn inbound_listener_fd(&self) -> i32 {
+        self.inbound.listener_fd()
+    }
 }
 
 #[derive(Copy, Clone)]
